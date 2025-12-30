@@ -37,7 +37,7 @@ from src.nn.modules.trm_block import (
     RotaryEmbedding,
     RotaryEmbedding2D,
 )
-from src.nn.modules.sigreg import compute_sigreg_loss
+#from src.nn.modules.sigreg import compute_sigreg_loss
 from src.nn.modules.utils import stablemax_cross_entropy, trunc_normal_init_
 from src.nn.utils import RankedLogger
 

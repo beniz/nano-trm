@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Optional
 
 import lightning
-import wandb
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 
@@ -24,32 +23,6 @@ log = RankedLogger(__name__, rank_zero_only=True)
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-import os
-os.environ["WANDB_CONSOLE"] = "wrap" # too see logs in the wandb console
-
-def flatten_config(cfg, parent_key="", sep="."):
-    """Flatten a nested config to avoid W&B duplication."""
-    items = []
-    config_dict = OmegaConf.to_container(cfg, resolve=True)
-
-    def _flatten(obj, parent_key=""):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                new_key = f"{parent_key}{sep}{k}" if parent_key else k
-                if isinstance(v, (dict, list)) and not isinstance(v, str):
-                    _flatten(v, new_key)
-                else:
-                    items.append((new_key, v))
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
-                new_key = f"{parent_key}{sep}{i}" if parent_key else str(i)
-                if isinstance(v, (dict, list)) and not isinstance(v, str):
-                    _flatten(v, new_key)
-                else:
-                    items.append((new_key, v))
-
-    _flatten(config_dict)
-    return dict(items)
 
 
 def update_model_config(cfg: DictConfig, datamodule: LightningDataModule):
@@ -107,8 +80,6 @@ def train(cfg: DictConfig) -> Optional[float]:
     if loggers:
         log.info("Logging hyperparameters!")
         log_hyperparameters(object_dict)
-        if not cfg.sweep_mode and wandb.run is not None:
-            wandb.config.update(flatten_config(cfg), allow_val_change=True)
 
     log.info("Starting training!")
 
@@ -129,11 +100,8 @@ def train(cfg: DictConfig) -> Optional[float]:
 
     if cfg.save_dir is not None:
         save_dir = cfg.save_dir
-        # Append wandb run name to save_dir if enabled
-        if cfg.append_wandb_name_to_save_dir and wandb.run and wandb.run.name:
-            save_dir = save_dir.rstrip("/") + "/" + wandb.run.name
-            log.info(f"Uploading training output to: {save_dir}")
-            shutil.copytree(output_dir, save_dir)
+        log.info(f"Uploading training output to: {save_dir}")
+        shutil.copytree(output_dir, save_dir)
 
 
 @hydra.main(version_base="1.3", config_path="./configs", config_name="train.yaml")
