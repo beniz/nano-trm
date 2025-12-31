@@ -1,0 +1,9 @@
+# Visdom logger built in lightning
+
+visdom:
+  _target_: src.nn.utils.visdom_logger.VisdomLogger
+  save_dir: "${paths.output_dir}"
+  name: "visdom"
+  server: "http://localhost"
+  port: 8097
+  env: "${paths.output_dir}"
