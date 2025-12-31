@@ -47,6 +47,9 @@ class SupervisedTRMModule(LightningModule):
             log.info("Training configuration (supervised wrapper):")
             log.info(f"  Steps per epoch: {steps_per_epoch}")
             log.info(f"  Total steps: {self.total_steps}")
+            # Optional compilation for speed when available
+            if hasattr(self.backbone, "maybe_compile_inner_forward"):
+                self.backbone.maybe_compile_inner_forward()
 
     def forward(self, batch: Dict[str, torch.Tensor]):
         return self.backbone.forward(batch)

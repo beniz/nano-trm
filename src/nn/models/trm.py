@@ -5,24 +5,14 @@ HRM PyTorch Lightning Module - Following Figure 2 pseudocode exactly
 import os
 import math
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Dict, Tuple
 
-from sklearn import metrics
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.nn.modules.utils import compute_lr
 from src.nn.utils.constants import IGNORE_LABEL_ID
-
-try:
-    from adam_atan2 import AdamATan2
-    print(f"*"*60)
-    print("Imported AdamATan2 successfully")
-except ImportError:
-    print("Failed to import adam2")
-
-from lightning import LightningModule
 
 from src.nn.modules.sparse_embeddings import (
     CastedSparseEmbedding,
@@ -60,9 +50,12 @@ class TRMCarry:
     current_data: Dict[str, torch.Tensor]  # Stores current batch data
 
 
-class TRMModule(LightningModule):
+class TRMModule(nn.Module):
     """
     HRM implementation following Figure 2 pseudocode exactly.
+
+    This class is now a pure nn.Module. Training, logging, and optimizer
+    logic are handled by external wrappers (e.g., SupervisedTRMModule).
     """
 
     def __init__(
@@ -97,10 +90,36 @@ class TRMModule(LightningModule):
         output_dir: str = None,
     ):
         super().__init__()
-        self.save_hyperparameters()
-
-        # CRITICAL: Manual optimization
-        self.automatic_optimization = False
+        self.hparams = SimpleNamespace(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            max_grid_size=max_grid_size,
+            H_cycles=H_cycles,
+            L_cycles=L_cycles,
+            N_supervision=N_supervision,
+            N_supervision_val=N_supervision_val,
+            ffn_expansion=ffn_expansion,
+            learning_rate=learning_rate,
+            learning_rate_emb=learning_rate_emb,
+            weight_decay=weight_decay,
+            warmup_steps=warmup_steps,
+            halt_exploration_prob=halt_exploration_prob,
+            puzzle_emb_dim=puzzle_emb_dim,
+            puzzle_emb_len=puzzle_emb_len,
+            rope_theta=rope_theta,
+            pos_emb_type=pos_emb_type,
+            lr_min_ratio=lr_min_ratio,
+            use_sigreg=use_sigreg,
+            use_mlp=use_mlp,
+            attn_gate_type=attn_gate_type,
+            vocab_size=vocab_size,
+            num_puzzles=num_puzzles,
+            batch_size=batch_size,
+            pad_value=pad_value,
+            seq_len=seq_len,
+            output_dir=output_dir,
+        )
 
         self.forward_dtype = torch.float32
 
@@ -191,48 +210,28 @@ class TRMModule(LightningModule):
             self.puzzle_emb = None
             self.puzzle_emb_len = 0
 
+        self.carry = None
         self.manual_step = 0
 
-    def setup(self, stage: str):
-        """Called by Lightning when setting up the model."""
-        if stage == "fit":
-            # Calculate steps from dataset and epochs
-            dm = self.trainer.datamodule
-        
-            # Use num_groups for steps calculation (not total puzzles)
-            if hasattr(dm, 'num_train_groups'):
-                samples_per_epoch = dm.num_train_groups
-            else:
-                samples_per_epoch = len(dm.train_dataset)
-            
-            steps_per_epoch = samples_per_epoch // dm.batch_size
-            
-            if self.trainer.max_epochs > 0:
-                self.total_steps = steps_per_epoch * self.trainer.max_epochs
-            else:
-                self.total_steps = float("inf")
-
-            log.info("Training configuration:")
-            log.info(f"  Groups (unique puzzles): {getattr(dm, 'num_train_groups', 'N/A')}")
-            log.info(f"  Total puzzles (with aug): {len(dm.train_dataset)}")
-            log.info(f"  Steps per epoch: {steps_per_epoch}")
-            log.info(f"  Total steps: {self.total_steps}")
-
-                # Add torch.compile for faster training
-            if "DISABLE_COMPILE" not in os.environ and hasattr(torch, 'compile') and self.device.type == "cuda":
-                try:
-                    log.info("Compiling inner_forward with torch.compile...")
-                    self.inner_forward = torch.compile(
-                        self.inner_forward,
-                        mode="reduce-overhead",  # Good for repeated calls (your H/L cycles)
-                        fullgraph=False,         # Allow graph breaks for dynamic control flow
-                    )
-                    log.info("Compilation successful")
-                except Exception as e:
-                    log.warning(f"torch.compile failed, running uncompiled: {e}")
-            else:
-                log.info('*' * 60)
-                log.info("torch.compile not available or disabled, running uncompiled")
+    def maybe_compile_inner_forward(self):
+        """Optionally compile inner_forward for speed when CUDA + torch.compile are available."""
+        if "DISABLE_COMPILE" in os.environ:
+            return
+        if not hasattr(torch, "compile"):
+            return
+        device = next(self.parameters()).device
+        if device.type != "cuda":
+            return
+        try:
+            log.info("Compiling inner_forward with torch.compile...")
+            self.inner_forward = torch.compile(
+                self.inner_forward,
+                mode="reduce-overhead",
+                fullgraph=False,
+            )
+            log.info("Compilation successful")
+        except Exception as e:
+            log.warning(f"torch.compile failed, running uncompiled: {e}")
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -319,7 +318,11 @@ class TRMModule(LightningModule):
         z_H = self.lenet(z_H, z_L, **seq_info)
 
         if self.training and self.hparams.use_sigreg:
-            self._sigreg_loss = compute_sigreg_loss(z_H, z_L, global_step=self.manual_step, num_slices=self.sigreg_slices)
+            if "compute_sigreg_loss" not in globals():
+                raise RuntimeError("Sigreg loss requested but compute_sigreg_loss is not imported.")
+            self._sigreg_loss = compute_sigreg_loss(
+                z_H, z_L, global_step=self.manual_step, num_slices=self.sigreg_slices
+            )
     
         # LM Outputs
         new_carry = TRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
@@ -440,314 +443,21 @@ class TRMModule(LightningModule):
 
         return new_carry, total_loss, metrics, new_carry.halted.all()
 
-    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def create_sparse_optimizer(
+        self, lr: float, weight_decay: float, world_size: int = 1
+    ):
         """
-        Training step that implements supervision through multiple forward passes.
-        Each sequence can run up to N_supervision (halt_max_steps) times.
+        Optional helper to build the sparse embedding optimizer, matching the previous Lightning configure_optimizers.
         """
-        batch_size = batch["input"].shape[0]
+        if self.puzzle_emb is None:
+            return None
 
-        # Handle case when not attached to trainer (for testing)
-        try:
-            opts = self.optimizers()
-            if not isinstance(opts, list):
-                opts = [opts]
-        except RuntimeError:
-            # For testing without trainer
-            if not hasattr(self, "_optimizers"):
-                raise RuntimeError("No optimizer available. Set model._optimizers for testing.")
-            opts = self._optimizers
+        # Force sparse embedding local weights to be leaf tensors
+        self.puzzle_emb.local_weights = self.puzzle_emb.local_weights.detach().requires_grad_(True)
 
-        # Initialize carry if first batch
-        if self.carry is None:
-            self.carry = self.initial_carry(batch)
-
-        # Forward with loss computation
-        self.carry, loss, metrics, _ = self.compute_loss_and_metrics(self.carry, batch)
-
-        scaled_loss = loss / batch_size
-        scaled_loss.backward()
-
-        self.grad_monitoring()
-        self.gate_monitoring()
-
-        lr_this_step = None
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-
-        # Learning rate scheduling with warmup
-        current_step = self.manual_step
-
-        # Base learning rates for each optimizer
-        base_lrs = [self.hparams.learning_rate]
-        if len(opts) > 1:  # If we have puzzle embedding optimizer
-            base_lrs.append(self.hparams.learning_rate_emb)
-
-        # Compute learning rate for this step
-        for opt, base_lr in zip(opts, base_lrs):
-            if current_step < self.hparams.warmup_steps:
-                lr_this_step = compute_lr(
-                    base_lr=base_lr,
-                    lr_warmup_steps=self.hparams.warmup_steps,
-                    lr_min_ratio=self.hparams.lr_min_ratio,
-                    current_step=current_step,
-                    total_steps=self.total_steps,
-                )
-            else:
-                # Constant LR after warmup
-                lr_this_step = base_lr
-
-            # Update learning rate
-            if hasattr(opt, "_optimizer"):
-                for param_group in opt._optimizer.param_groups:
-                    param_group["lr"] = lr_this_step
-                opt._optimizer.step()
-                opt._optimizer.zero_grad()
-            else:
-                for param_group in opt.param_groups:
-                    param_group["lr"] = lr_this_step
-                opt.step()
-                opt.zero_grad()
-
-        self.log_metrics(metrics, lr_this_step=lr_this_step, batch_size=batch_size)
-
-        # Assert LM loss is not NaN
-        assert not torch.isnan(metrics.get("lm_loss")), f"LM loss is NaN at step {self.manual_step}"
-
-        self.manual_step += 1
-
-        return loss
-
-    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """Simplified validation using loss head."""
-        batch_size = batch["input"].shape[0]
-
-        with torch.no_grad():
-            # Create fresh carry for validation
-            carry = self.initial_carry(batch)
-
-            # Accumulate metrics across all supervision steps
-            accumulated_metrics = {}
-            total_loss = 0.0
-            n_steps = 0
-
-            # Run up to N_supervision iterations
-            while True:
-                # Forward with loss computation
-                carry, loss, metrics, all_halted = self.compute_loss_and_metrics(carry, batch)
-
-                # Accumulate metrics
-                for k, v in metrics.items():
-                    accumulated_metrics[k] = accumulated_metrics.get(k, 0) + v.item()
-
-                total_loss += loss.item()
-                n_steps += 1
-
-                if all_halted:
-                    break
-
-            # Compute averages
-            count = accumulated_metrics.get("count", batch_size)
-            if count > 0:
-                avg_metrics = {
-                    "val/loss": total_loss / (n_steps * batch_size),
-                    "val/accuracy": accumulated_metrics.get("accuracy", 0) / count,
-                    "val/exact_accuracy": accumulated_metrics.get("exact_accuracy", 0) / count,
-                    "val/q_halt_accuracy": accumulated_metrics.get("q_halt_accuracy", 0) / count,
-                    "val/steps": accumulated_metrics.get("steps", 0) / count,
-                    "val/lm_loss": accumulated_metrics.get("lm_loss", 0) / (n_steps * batch_size),
-                    "val/q_halt_loss": accumulated_metrics.get("q_halt_loss", 0)
-                    / (n_steps * batch_size),
-                }
-            else:
-                avg_metrics = {
-                    f"val/{k}": 0.0
-                    for k in [
-                        "loss",
-                        "accuracy",
-                        "exact_accuracy",
-                        "q_halt_accuracy",
-                        "steps",
-                        "lm_loss",
-                        "q_halt_loss",
-                    ]
-                }
-
-            # Log metrics
-            for name, value in avg_metrics.items():
-                self.log(
-                    name,
-                    value,
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=(name in ["val/loss", "val/exact_accuracy"]),
-                    sync_dist=True,
-                )
-            return avg_metrics
-
-    def grad_monitoring(self):
-        with torch.no_grad():
-            # 1. Total gradient norm
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.parameters(), 
-                max_norm=float('inf')  # Don't actually clip, just compute norm
-            ).item()
-            
-            # 2. Key component gradient norms
-            grad_metrics = {}
-            
-            # First attention layer
-            if hasattr(self.lenet.layers[0], 'self_attn') and \
-                self.lenet.layers[0].self_attn.qkv_proj.weight.grad is not None:
-                    grad_metrics['first_attn'] = self.lenet.layers[0].self_attn.qkv_proj.weight.grad.norm().item()
-            
-            # Last MLP layer
-            if self.lenet.layers[-1].mlp.down_proj.weight.grad is not None:
-                grad_metrics['last_mlp'] = self.lenet.layers[-1].mlp.down_proj.weight.grad.norm().item()
-            
-            # Output heads
-            if self.lm_head.weight.grad is not None:
-                grad_metrics['lm_head'] = self.lm_head.weight.grad.norm().item()
-            
-            if self.q_head.weight.grad is not None:
-                grad_metrics['q_head'] = self.q_head.weight.grad.norm().item()
-            
-            # Log main metric
-            self.log('grad/total_norm', total_grad_norm, on_step=True, prog_bar=True)
-            
-            # Log gradient flow ratio (first vs last layer)
-            if 'first_attn' in grad_metrics and 'last_mlp' in grad_metrics:
-                ratio = grad_metrics['first_attn'] / (grad_metrics['last_mlp'] + 1e-8)
-                self.log('grad/flow_ratio', ratio, on_step=True, prog_bar=True)
-            
-            # Optional: log individual components
-            for name, value in grad_metrics.items():
-                self.log(f'grad/{name}', value, on_step=True)
-            
-            # Warning for problematic gradients
-            if total_grad_norm < 1e-6 or total_grad_norm > 100:
-                log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
-
-    def gate_monitoring(self):
-        """Add to grad_monitoring or call separately"""
-        with torch.no_grad():
-            for layer_idx, layer in enumerate(self.lenet.layers):
-                if hasattr(layer, 'self_attn') and layer.self_attn.gate_proj is not None:
-                    gate_proj = layer.self_attn.gate_proj
-                    
-                    # Check if weights are changing
-                    weight_norm = gate_proj.weight.norm().item()
-                    bias_mean = gate_proj.bias.mean().item() if gate_proj.bias is not None else 0
-                    
-                    # Effective gate at bias (when input is ~zero mean)
-                    effective_gate = torch.sigmoid(torch.tensor(bias_mean)).item()
-                    
-                    self.log(f'gate/layer{layer_idx}/weight_norm', weight_norm)
-                    self.log(f'gate/layer{layer_idx}/bias_mean', bias_mean)
-                    self.log(f'gate/layer{layer_idx}/effective_gate', effective_gate)
-                    
-                    # Check gradient if available
-                    if gate_proj.weight.grad is not None:
-                        self.log(f'gate/layer{layer_idx}/grad_norm', gate_proj.weight.grad.norm().item())
-
-    def log_metrics(self, metrics: dict, lr_this_step: float = None, batch_size: int = None):
-
-        # Log learning rate (will log the last optimizer's LR)
-        self.log("train/lr", lr_this_step, on_step=True)
-
-        # Log metrics
-        if metrics.get("count", 0) > 0:
-            with torch.no_grad():
-                count = metrics["count"]
-                self.log("train/accuracy", metrics.get("accuracy", 0) / count, on_step=True)
-                self.log(
-                    "train/exact_accuracy",
-                    metrics.get("exact_accuracy", 0) / count,
-                    prog_bar=True,
-                    on_step=True,
-                )
-                self.log(
-                    "train/q_halt_accuracy",
-                    metrics.get("q_halt_accuracy", 0) / count,
-                    on_step=True,
-                )
-                self.log(
-                    "train/steps",
-                    metrics.get("steps", 0) / count,
-                    prog_bar=True,
-                    on_step=True,
-                )
-
-                self.log("train/lm_loss", metrics.get("lm_loss", 0) / batch_size, on_step=True)
-                self.log(
-                    "train/q_halt_loss", metrics.get("q_halt_loss", 0) / batch_size, on_step=True
-                )
-
-                avg_halt_steps = metrics.get("steps", 0) / metrics["count"]
-                early_halt_rate = avg_halt_steps < self.hparams.N_supervision
-                self.log("train/early_halt_rate", early_halt_rate, on_step=True)
-
-                if self.hparams.use_sigreg:
-                    self.log("train/sigreg_loss", metrics["sigreg_loss"], on_step=True)
-
-    def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """Test step - same as validation."""
-        return self.validation_step(batch, batch_idx)
-
-    def on_validation_epoch_start(self):
-        """Don't interfere with training carry during validation."""
-        pass
-
-    def on_validation_epoch_end(self):
-        """Don't interfere with training carry during validation."""
-        pass
-
-    def on_train_epoch_start(self):
-        # Update sampler epoch for proper shuffling
-        if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule is not None:
-            dm = self.trainer.datamodule
-            if hasattr(dm, 'on_train_epoch_start'):
-                dm.on_train_epoch_start(self.current_epoch)
-    
-    def configure_optimizers(self):
-        """Configure optimizer with different learning rates for different parameter groups."""
-
-        base_lr = self.hparams.learning_rate
-        embedding_lr = self.hparams.learning_rate_emb
-
-        optimizers = []
-
-        # Main optimizer
-        # Use AdamATan2 if available
-        try:
-            main_opt = AdamATan2(
-                self.parameters(),
-                lr=base_lr,
-                weight_decay=self.hparams.weight_decay,
-                betas=(0.9, 0.95),
-            )
-        except NameError:
-            main_opt = torch.optim.AdamW(
-                self.parameters(),
-                lr=base_lr,
-                weight_decay=self.hparams.weight_decay,
-                betas=(0.9, 0.95),
-            )
-        optimizers.append(main_opt)
-
-        # Force sparse embedding to be leaf tensors
-        if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
-            # Force sparse embedding local weights to be leaf tensors
-            self.puzzle_emb.local_weights = self.puzzle_emb.local_weights.detach().requires_grad_(
-                True
-            )
-
-            # Add sparse embedding optimizer
-            sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
-                self.puzzle_emb.buffers(),
-                lr=embedding_lr,
-                weight_decay=self.hparams.weight_decay,
-                world_size=1,
-            )
-            optimizers.append(sparse_opt)
-
-        return optimizers
+        return CastedSparseEmbeddingSignSGD_Distributed(
+            self.puzzle_emb.buffers(),
+            lr=lr,
+            weight_decay=weight_decay,
+            world_size=world_size,
+        )
