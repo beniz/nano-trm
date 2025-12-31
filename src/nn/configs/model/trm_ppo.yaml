@@ -1,0 +1,62 @@
+# TRM backbone + PPO heads via TRMPPOTrainer
+
+_target_: src.nn.trainers.ppo_trainer.TRMPPOTrainer
+_recursive_: false
+
+backbone:
+  _target_: src.nn.models.trm.TRMModule
+  _recursive_: false
+  ffn_expansion: ${model_tuning.ffn_expansion}
+  hidden_size: ${model_tuning.hidden_size}
+  num_layers: ${model_tuning.num_layers}
+  N_supervision: ${model_tuning.N_supervision}
+  N_supervision_val: ${model_tuning.N_supervision_val}
+  learning_rate: ${model_tuning.learning_rate}
+  H_cycles: ${model_tuning.H_cycles}
+  L_cycles: ${model_tuning.L_cycles}
+  learning_rate_emb: ${model_tuning.learning_rate_emb}
+  weight_decay: ${model_tuning.weight_decay}
+  halt_exploration_prob: ${model_tuning.halt_exploration_prob}
+  warmup_steps: ${model_tuning.warmup_steps}
+  num_heads: ${model_tuning.num_heads}
+  puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
+  puzzle_emb_len: ${model_tuning.puzzle_emb_len}
+  rope_theta: ${model_tuning.rope_theta}
+  pos_emb_type: ${model_tuning.pos_emb_type}
+  lr_min_ratio: ${model_tuning.lr_min_ratio}
+  use_sigreg: ${model_tuning.use_sigreg}
+  use_mlp: ${model_tuning.use_mlp}
+  attn_gate_type: ${model_tuning.attn_gate_type}
+  output_dir: null
+  num_puzzles: 0
+  batch_size: ${timekeeping.batch_size}
+  pad_value: 0
+  max_grid_size: 0
+  vocab_size: 0
+  seq_len: 0
+
+policy_head:
+  _target_: torch.nn.Linear
+  in_features: ${model_tuning.hidden_size}
+  out_features: 4  # 4-way actions
+
+value_head:
+  _target_: torch.nn.Linear
+  in_features: ${model_tuning.hidden_size}
+  out_features: 1
+
+rollout_buffer:
+  _target_: src.nn.rl.rollout_buffer.RolloutBuffer
+  capacity: ${ppo.rollout_steps}
+
+gamma: ${ppo.gamma}
+gae_lambda: ${ppo.gae_lambda}
+clip_eps: ${ppo.clip_eps}
+entropy_coef: ${ppo.entropy_coef}
+value_coef: ${ppo.value_coef}
+ppo_epochs: ${ppo.ppo_epochs}
+minibatch_size: ${ppo.minibatch_size}
+rollout_steps: ${ppo.rollout_steps}
+optimizer_cfg:
+  lr: ${ppo.lr}
+  weight_decay: ${ppo.weight_decay}

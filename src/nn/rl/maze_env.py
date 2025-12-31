@@ -56,7 +56,7 @@ class MazeEnv:
             raise ValueError("Maze must contain start 'S' and goal 'G'")
         return tuple(start_idxs[0]), tuple(goal_idxs[0])
 
-    def reset(self, maze: np.ndarray) -> np.ndarray:
+    def reset(self, maze: np.ndarray, start_pos: Tuple[int, int] | None = None) -> np.ndarray:
         """Reset environment with a new maze (expects a 2D grid)."""
         if maze.ndim != 2:
             raise ValueError(f"Expected 2D maze grid, got shape {maze.shape}")
@@ -64,6 +64,10 @@ class MazeEnv:
         self._init_token_map(maze)
         self.grid = maze.copy()
         self.agent_pos, self.goal_pos = self._find_positions(self.grid)
+
+        # Optionally start the agent at a provided position
+        if start_pos is not None:
+            self.agent_pos = start_pos
 
         h, w = self.grid.shape
         num_cells = h * w

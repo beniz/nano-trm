@@ -1,0 +1,7 @@
+_target_: src.nn.data.MazeRLDataModule
+_recursive_: false
+
+batch_size: ${timekeeping.batch_size}
+num_workers: ${timekeeping.num_workers}
+data_dir: ./data/maze-30x30-hard-1k
+pad_value: 0

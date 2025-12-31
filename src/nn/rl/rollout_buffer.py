@@ -23,7 +23,7 @@ class RolloutBuffer:
     def add(self, **kwargs) -> None:
         if not self.storage:
             for k, v in kwargs.items():
-                shape = (self.capacity,) + tuple(v.shape[1:])
+                shape = (self.capacity,) + tuple(v.shape)  # keep env + feature dims
                 self.storage[k] = torch.zeros(shape, dtype=v.dtype, device=v.device)
         idx = self.ptr
         for k, v in kwargs.items():
@@ -37,9 +37,18 @@ class RolloutBuffer:
         return {k: v[: self.ptr] for k, v in self.storage.items()}
 
     def iter_minibatches(self, minibatch_size: int) -> Iterator[Dict[str, torch.Tensor]]:
-        idx = torch.randperm(self.ptr)
-        for start in range(0, self.ptr, minibatch_size):
+        """
+        Flattens time and env dimensions for sampling minibatches.
+        Expects stored tensors shaped [T, N, ...].
+        """
+        if self.ptr == 0:
+            return
+        # Flatten first two dims (T * N, ...)
+        flat_storage = {k: v[: self.ptr].reshape(-1, *v.shape[2:]) for k, v in self.storage.items()}
+        total = next(iter(flat_storage.values())).shape[0]
+        idx = torch.randperm(total, device=next(iter(flat_storage.values())).device)
+        for start in range(0, total, minibatch_size):
             mb_idx = idx[start : start + minibatch_size]
-            minibatch = {k: v[mb_idx] for k, v in self.storage.items()}
+            minibatch = {k: v[mb_idx] for k, v in flat_storage.items()}
             minibatch["indices"] = mb_idx
             yield minibatch

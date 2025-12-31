@@ -52,6 +52,8 @@ class VisdomLogger(Logger):
                 env=self._env,
                 raise_exceptions=self._raise_exceptions,
             )
+            if self._viz.check_connection():
+                print(f"[Visdom] Connected to {self._server}:{self._port}, env='{self._env}'")
         return self._viz
 
     @rank_zero_only
@@ -63,6 +65,10 @@ class VisdomLogger(Logger):
     def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
         if step is None:
             step = 0
+        if hasattr(step, "item"):
+            step = int(step.item())
+        else:
+            step = int(step)
         for name, value in metrics.items():
             if hasattr(value, "item"):
                 value = value.item()
@@ -85,6 +91,7 @@ class VisdomLogger(Logger):
                     opts={"title": name, "xlabel": "step", "ylabel": name},
                 )
                 self._metric_windows[name] = win
+                print(f"[Visdom] Created plot for '{name}' in env='{self._env}' at step={step}")
 
     @rank_zero_only
     def finalize(self, status: str) -> None:

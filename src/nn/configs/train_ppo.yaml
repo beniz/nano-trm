@@ -1,0 +1,70 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: maze_rl
+  - model: trm_ppo     # PPO trainer + TRM backbone
+  - callbacks: default
+  - logger: many_loggers
+  - trainer: gpu
+  - paths: default
+  - extras: default
+  - hydra: default
+  - optional local: default
+
+task_name: "train_ppo"
+
+tags: ["ppo", "maze"]
+
+visdom_env: "train_ppo"
+
+trainer:
+  log_every_n_steps: 1
+
+timekeeping:
+  max_epochs: 100000
+  batch_size: 32
+  num_workers: 0
+
+model_tuning:
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-4
+  warmup_steps: 2000
+  weight_decay: 1.0
+  lr_min_ratio: 1.0
+  num_heads: 8
+  halt_exploration_prob: 0.1
+  N_supervision: 16
+  N_supervision_val: 16
+  H_cycles: 3
+  L_cycles: 4
+  num_layers: 2
+  puzzle_emb_dim: 0
+  puzzle_emb_len: 0
+  hidden_size: 512
+  ffn_expansion: 4
+  rope_theta: 10000
+  pos_emb_type: "1d"
+  use_mlp: false
+  use_sigreg: false
+  attn_gate_type: null
+
+# PPO hyperparameters
+ppo:
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  rollout_steps: 128
+  ppo_epochs: 4
+  minibatch_size: 64
+  lr: 3e-4
+  weight_decay: 0.01
+  grad_accum_steps: 1
+
+seed: 12345
+ckpt_path: null
+save_dir: null
+append_wandb_name_to_save_dir: false
+sweep_mode: false

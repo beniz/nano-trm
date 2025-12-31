@@ -6,4 +6,4 @@ visdom:
   name: "visdom"
   server: "http://localhost"
   port: 8097
-  env: "${paths.output_dir}"
+  env: ${visdom_env}

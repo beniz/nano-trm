@@ -26,15 +26,29 @@ from omegaconf import DictConfig, OmegaConf
 
 
 def update_model_config(cfg: DictConfig, datamodule: LightningDataModule):
-    # Add num_puzzles to model config
-    cfg.model.num_puzzles = datamodule.num_puzzles
-    cfg.model.batch_size = datamodule.batch_size
-    cfg.model.pad_value = datamodule.pad_value
-    cfg.model.max_grid_size = datamodule.max_grid_size
-    cfg.model.vocab_size = datamodule.vocab_size
-    cfg.model.seq_len = cfg.model.max_grid_size * cfg.model.max_grid_size
+    """
+    Propagate datamodule metadata into the model/backbone config.
+    Supports both direct model configs and nested backbone configs (PPO).
+    """
+    target_cfg = cfg.model.backbone if "backbone" in cfg.model else cfg.model
+
+    for attr in ["num_puzzles", "batch_size", "pad_value", "max_grid_size", "vocab_size", "grid_size", "seq_len"]:
+        if hasattr(datamodule, attr) and attr in target_cfg:
+            setattr(target_cfg, attr, getattr(datamodule, attr))
+
+    if "seq_len" in target_cfg and hasattr(datamodule, "seq_len"):
+        target_cfg.seq_len = datamodule.seq_len
+    elif "max_grid_size" in target_cfg and getattr(target_cfg, "max_grid_size", None):
+        target_cfg.seq_len = target_cfg.max_grid_size * target_cfg.max_grid_size
+    elif hasattr(datamodule, "grid_size"):
+        target_cfg.max_grid_size = getattr(datamodule, "grid_size")
+        target_cfg.seq_len = target_cfg.max_grid_size * target_cfg.max_grid_size
+
     log.info(
-        f"Setting model config from data module:  num_puzzles = {datamodule.num_puzzles} batch_size = {datamodule.batch_size} vocab_size = {datamodule.vocab_size}"
+        f"Setting model config from data module (where available): "
+        f"num_puzzles={getattr(datamodule, 'num_puzzles', 'n/a')} "
+        f"batch_size={getattr(datamodule, 'batch_size', 'n/a')} "
+        f"vocab_size={getattr(datamodule, 'vocab_size', 'n/a')}"
     )
 
 
@@ -55,7 +69,12 @@ def train(cfg: DictConfig) -> Optional[float]:
     update_model_config(cfg, datamodule)
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(cfg.model, output_dir=output_dir)
+    model_kwargs = {}
+    target = getattr(cfg.model, "_target_", "")
+    # Only pass output_dir to models that accept it (skip PPO trainer wrapper)
+    if "ppo_trainer" not in str(target):
+        model_kwargs["output_dir"] = output_dir
+    model: LightningModule = hydra.utils.instantiate(cfg.model, **model_kwargs)
 
     log.info("Instantiating callbacks...")
     callbacks: list[Callback] = instantiate_callbacks(cfg.get("callbacks"))

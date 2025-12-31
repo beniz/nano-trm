@@ -295,7 +295,7 @@ class TRMModule(nn.Module):
         )
     
     def inner_forward(
-        self, carry: TRMInnerCarry, batch: Dict[str, torch.Tensor]
+        self, carry: TRMInnerCarry, batch: Dict[str, torch.Tensor], *, detach_carry: bool = True
     ) -> Tuple[TRMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.pos_embedding() if hasattr(self, "pos_embedding") else None,
@@ -325,7 +325,14 @@ class TRMModule(nn.Module):
             )
     
         # LM Outputs
-        new_carry = TRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        if detach_carry:
+            z_H_carry = z_H.detach()
+            z_L_carry = z_L.detach()
+        else:
+            z_H_carry = z_H
+            z_L_carry = z_L
+
+        new_carry = TRMInnerCarry(z_H=z_H_carry, z_L=z_L_carry)  # New carry (optionally detached)
         output = self.lm_head(z_H)[:, self.puzzle_emb_len :]
         q_logits = self.q_head(z_H[:, 0]).to(
             torch.float32
@@ -461,3 +468,32 @@ class TRMModule(nn.Module):
             weight_decay=weight_decay,
             world_size=world_size,
         )
+
+    def forward_features(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Returns features suitable for downstream heads (e.g., policy/value).
+        Uses a fresh carry per call (no persistent state).
+        """
+        obs = batch["input"]
+        if obs.dim() > 2:
+            obs = obs.view(obs.shape[0], -1)
+        puzzle_ids = batch.get("puzzle_identifiers")
+        if puzzle_ids is None:
+            puzzle_ids = torch.zeros(obs.shape[0], dtype=torch.int32, device=obs.device)
+        if puzzle_ids.dim() == 0:
+            puzzle_ids = puzzle_ids.view(1).expand(obs.shape[0])
+        proc_batch = {
+            "input": obs.to(torch.int64),
+            "puzzle_identifiers": puzzle_ids.to(torch.int32),
+        }
+
+        carry = self.initial_carry(proc_batch)
+        inner_carry, _, _ = self.inner_forward(carry.inner_carry, proc_batch, detach_carry=False)
+        # Use z_H as shared representation; policy/value heads can slice as needed.
+        feats = {
+            "z_H": inner_carry.z_H,
+            "z_L": inner_carry.z_L,
+            "policy_input": inner_carry.z_H[:, 0],            # first token (puzzle_emb position)
+            "value_input": inner_carry.z_H.mean(dim=1),        # simple mean pool over sequence
+        }
+        return feats

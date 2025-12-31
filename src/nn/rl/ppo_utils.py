@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Dict, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.distributions import Categorical
 
 
@@ -13,23 +12,26 @@ def compute_gae(
     dones: torch.Tensor,
     gamma: float,
     lam: float,
+    last_values: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generalized Advantage Estimation.
 
-    rewards, values, dones: shape [T, ...]
+    rewards, values, dones: shape [T, N]
+    last_values: shape [N] (bootstrap value for final state)
     """
     T = rewards.shape[0]
     advantages = torch.zeros_like(rewards)
-    last_adv = 0.0
+    last_adv = torch.zeros_like(last_values)
+    values_ext = torch.cat([values, last_values.unsqueeze(0)], dim=0)
 
     for t in reversed(range(T)):
         mask = 1.0 - dones[t].float()
-        delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
+        delta = rewards[t] + gamma * values_ext[t + 1] * mask - values_ext[t]
         last_adv = delta + gamma * lam * mask * last_adv
         advantages[t] = last_adv
 
-    returns = advantages + values[:-1]
+    returns = advantages + values
     return advantages, returns
 
 
