@@ -76,6 +76,28 @@ def train(cfg: DictConfig) -> Optional[float]:
         model_kwargs["output_dir"] = output_dir
     model: LightningModule = hydra.utils.instantiate(cfg.model, **model_kwargs)
 
+    # If PPO trainer, wire eval set from datamodule val split (if available)
+    try:
+        from src.nn.trainers.ppo_trainer import TRMPPOTrainer  # local import to avoid circulars
+    except Exception:
+        TRMPPOTrainer = None
+    if TRMPPOTrainer is not None and isinstance(model, TRMPPOTrainer):
+        val_ds = getattr(datamodule, "val_dataset", None)
+        if val_ds is None or len(val_ds) == 0:
+            raise ValueError("PPO eval requires a non-empty val_dataset; none found.")
+        # MazeDataset stores numpy inputs; convert to numpy array of grids
+        try:
+            val_inputs = val_ds.inputs
+            # If stored flattened, reshape to [N, H, W] using grid_size from dataset
+            if val_inputs.ndim == 2 and hasattr(val_ds, "grid_size"):
+                gs = int(val_ds.grid_size)
+                val_inputs = val_inputs.reshape(val_inputs.shape[0], gs, gs)
+            interval = cfg.get("ppo", {}).get("eval_steps", 1)
+            model.eval_config = {"mazes": val_inputs, "interval": max(1, int(interval))}
+            log.info(f"Enabled eval every {interval} PPO cycles on {len(val_ds)} val mazes.")
+        except Exception as e:
+            raise ValueError(f"Could not set eval_config from val dataset: {e}") from e
+
     log.info("Instantiating callbacks...")
     callbacks: list[Callback] = instantiate_callbacks(cfg.get("callbacks"))
 

@@ -77,6 +77,7 @@ class TRMPPOTrainer(LightningModule):
         self.test_reward_accum: List[float] = []
         self.test_path_accum: List[int] = []
         self._ppo_epoch_counter: int = 0  # track PPO epochs for logging cadence
+        self.eval_config: Optional[Dict[str, Any]] = None  # set externally for periodic eval
 
     def policy_value(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -236,7 +237,12 @@ class TRMPPOTrainer(LightningModule):
 
         rewards = []
         paths = []
-        for env, maze in zip(self.test_envs, mazes_np):
+        for env, maze in tqdm(
+            list(zip(self.test_envs, mazes_np)),
+            desc="Eval rollouts",
+            leave=False,
+            total=len(mazes_np),
+        ):
             obs = env.reset(maze)
             done = False
             ep_reward = 0.0
@@ -333,11 +339,11 @@ class TRMPPOTrainer(LightningModule):
                     opt.zero_grad()
 
                 stats = {k: float(v) for k, v in loss_terms.items()}
-                print(
-                    f"loss={loss.item():.4f} policy={stats.get('policy_loss', 0):.4f} "
-                    f"value={stats.get('value_loss', 0):.4f} entropy={stats.get('entropy', 0):.4f}",
-                    end="\r",
-                )
+                # print(
+                #     f"loss={loss.item():.4f} policy={stats.get('policy_loss', 0):.4f} "
+                #     f"value={stats.get('value_loss', 0):.4f} entropy={stats.get('entropy', 0):.4f}",
+                #     end="\r",
+                # )
             self._ppo_epoch_counter += 1
 
         return loss, stats
@@ -372,6 +378,17 @@ class TRMPPOTrainer(LightningModule):
             avg_test_reward, avg_test_path = self._eval_envs(test_mazes)
             self.log("ppo/test_avg_reward", avg_test_reward, on_step=True, on_epoch=False, prog_bar=False)
             self.log("ppo/test_avg_path_len", avg_test_path, on_step=True, on_epoch=False, prog_bar=False)
+
+        # Eval on val set after each rollout+update cycle (if provided at init)
+        eval_cfg = getattr(self, "eval_config", None)
+        if eval_cfg and self.trainer:
+            interval = max(1, int(eval_cfg.get("interval", 1)))
+            if self._ppo_epoch_counter % interval == 0:
+                eval_mazes = eval_cfg.get("mazes")
+                if eval_mazes is not None:
+                    avg_eval_reward, avg_eval_path = self._eval_envs(eval_mazes)
+                    self.log("ppo/eval_avg_reward", avg_eval_reward, on_step=True, on_epoch=False, prog_bar=False)
+                    self.log("ppo/eval_avg_path_len", avg_eval_path, on_step=True, on_epoch=False, prog_bar=False)
 
         return loss
 
