@@ -38,9 +38,108 @@ def dihedral_transform(arr: np.ndarray, idx: int) -> np.ndarray:
         raise ValueError(f"Invalid dihedral index: {idx}")
 
 
+def _start_positions_from_solution(solution: np.ndarray) -> list[tuple[int, int]]:
+    """Return list of coordinates that lie on the solution path (token 'o')."""
+    return list(zip(*np.where(solution == ord("o"))))
+
+
+def _goal_distances(grid: np.ndarray) -> np.ndarray:
+    """Compute 4-neighbor shortest-path distances from the goal across non-wall cells."""
+    from collections import deque
+
+    h, w = grid.shape
+    goal_idx = np.argwhere(grid == ord("G"))
+    if goal_idx.size == 0:
+        return np.full_like(grid, fill_value=np.iinfo(np.int32).max, dtype=np.int32)
+
+    goal = tuple(goal_idx[0])
+    dist = np.full((h, w), fill_value=np.iinfo(np.int32).max, dtype=np.int32)
+    dist[goal] = 0
+
+    q = deque([goal])
+    while q:
+        r, c = q.popleft()
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and grid[nr, nc] != ord("#"):
+                if dist[nr, nc] > dist[r, c] + 1:
+                    dist[nr, nc] = dist[r, c] + 1
+                    q.append((nr, nc))
+    return dist
+
+
+def _move_start_on_path(
+    maze: np.ndarray, solution: np.ndarray, positions: list[tuple[int, int]]
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Create maze variants where the start 'S' is placed on provided path positions.
+
+    Returns a list of (maze_variant, solution) tuples.
+    """
+    variants = []
+    for r, c in positions:
+        maze_variant = maze.copy()
+        # Clear existing start
+        maze_variant[maze_variant == ord("S")] = ord(" ")
+        maze_variant[r, c] = ord("S")
+        variants.append((maze_variant, solution))
+    return variants
+
+
+def build_start_on_path_variants(
+    maze: np.ndarray,
+    solution: np.ndarray,
+    n_random: int,
+    near_goal_steps: Optional[int] = None,
+    exact_steps: Optional[int] = None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Generate variants with the start moved along the solution path.
+    Always include a middle-of-path variant plus up to n_random random positions.
+    If near_goal_steps is provided, restrict candidate positions to those within that
+    many steps (shortest path) to the goal.
+    If exact_steps is provided, keep only positions exactly that many steps from the goal.
+    """
+    path_positions = _start_positions_from_solution(solution)
+    if not path_positions:
+        return []
+
+    dist = _goal_distances(solution)
+
+    if exact_steps is not None:
+        path_positions = [p for p in path_positions if dist[p] == exact_steps]
+        if not path_positions:
+            return []
+
+    if near_goal_steps is not None:
+        path_positions = [p for p in path_positions if 0 < dist[p] <= near_goal_steps]
+        # If filtering removed everything, fall back to the closest path cell (excluding goal)
+        if not path_positions:
+            finite = [(p, dist[p]) for p in _start_positions_from_solution(solution) if dist[p] < np.iinfo(np.int32).max and dist[p] > 0]
+            if finite:
+                finite.sort(key=lambda x: x[1])
+                path_positions = [finite[0][0]]
+
+    indices = set()
+    # Middle-of-path
+    indices.add(len(path_positions) // 2)
+
+    if n_random > 0:
+        n_samples = min(n_random, len(path_positions))
+        sampled = np.random.choice(len(path_positions), size=n_samples, replace=False)
+        indices.update(int(i) for i in sampled)
+
+    selected_positions = [path_positions[i] for i in sorted(indices)]
+    return _move_start_on_path(maze, solution, selected_positions)
+
+
 def convert_subset(set_name: str, source_repo: str, output_dir: str,
                    subsample_size: Optional[int], num_aug: int,
-                   preloaded_data: Optional[Tuple] = None) -> Tuple[int, int, Optional[Tuple]]:
+                   preloaded_data: Optional[Tuple] = None,
+                   start_on_path_copies: int = 0,
+                   near_goal_steps: Optional[int] = None,
+                   only_start_on_path: bool = False,
+                   start_on_path_exact_steps: Optional[int] = None) -> Tuple[int, int, Optional[Tuple]]:
     """Convert a subset and return (num_groups, num_puzzles, remaining_data)."""
     
     # Read CSV or use preloaded data
@@ -104,12 +203,32 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
                 inp = dihedral_transform(orig_inp, transform_idx)
                 out = dihedral_transform(orig_out, transform_idx)
 
-            all_inputs.append(inp)
-            all_labels.append(out)
-            puzzle_identifiers.append(0)
-            
-            puzzle_id += 1
-            puzzle_indices.append(puzzle_id)
+            # Build variants: optionally keep original, plus start-on-path variants
+            variants = []
+            if not only_start_on_path:
+                variants.append((inp, out))
+            if start_on_path_copies > 0 or only_start_on_path:
+                variants.extend(
+                    build_start_on_path_variants(
+                        inp,
+                        out,
+                        start_on_path_copies,
+                        near_goal_steps,
+                        exact_steps=start_on_path_exact_steps,
+                    )
+                )
+
+            if not variants:
+                # Skip puzzles that produce no variants under the constraints
+                continue
+
+            for vinp, vout in variants:
+                all_inputs.append(vinp)
+                all_labels.append(vout)
+                puzzle_identifiers.append(0)
+
+                puzzle_id += 1
+                puzzle_indices.append(puzzle_id)
         
         # Close the group after all augmentations of this puzzle
         group_indices.append(puzzle_id)
@@ -140,6 +259,9 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
         "num_groups": num_groups,              # Unique base puzzles
         "num_augmentations": num_aug if set_name == "train" else 0,
         "mean_puzzles_per_group": num_puzzles / num_groups if num_groups > 0 else 1,
+        "start_on_path_copies": start_on_path_copies,
+        "near_goal_steps": near_goal_steps,
+        "start_on_path_exact_steps": start_on_path_exact_steps,
         "grid_size": grid_size,
         "max_grid_size": grid_size,
         "seq_len": seq_len,
@@ -176,8 +298,18 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 @click.option("--num-aug", type=int, default=7, help="Number of augmentations per puzzle (max 7 for dihedral)")
 @click.option("--eval-ratio", type=float, default=None, help="Ratio of test.csv to use for val (remainder goes to test)")
 @click.option("--seed", type=int, default=42, help="Random seed")
+@click.option("--start-on-path-copies", type=int, default=0,
+              help="For each puzzle, add this many random start-on-path variants plus one middle-path variant")
+@click.option("--near-goal-steps", type=int, default=None,
+              help="If set, only place start positions within this many steps of the goal (shortest path over open cells)")
+@click.option("--only-start-on-path", is_flag=True, default=False,
+              help="If set, drop the original maze and keep only start-on-path variants")
+@click.option("--start-exact-steps", type=int, default=None,
+              help="If set, keep only start positions exactly this many steps from the goal; puzzles without such positions are skipped")
 def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[int],
-                    num_aug: int, eval_ratio: Optional[float], seed: int):
+                    num_aug: int, eval_ratio: Optional[float], seed: int,
+                    start_on_path_copies: int, near_goal_steps: Optional[int],
+                    only_start_on_path: bool, start_exact_steps: Optional[int]):
     np.random.seed(seed)
     
     # Dihedral group has 8 elements (indices 0-7), so max meaningful num_aug is 7
@@ -186,7 +318,11 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
         num_aug = 7
     
     num_train_groups, num_train, _ = convert_subset("train", source_repo, output_dir, 
-                                                     subsample_size, num_aug)
+                                                     subsample_size, num_aug,
+                                                     start_on_path_copies=start_on_path_copies,
+                                                     near_goal_steps=near_goal_steps,
+                                                     only_start_on_path=only_start_on_path,
+                                                     start_on_path_exact_steps=start_exact_steps)
     
     # Val and test sets are taken from test.csv (no leakage with training)
     eval_subsample_size = None
@@ -200,13 +336,21 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
     
     # Generate val set, keeping remaining data for test
     num_val_groups, num_val, remaining_data = convert_subset("val", source_repo, output_dir, 
-                                                              eval_subsample_size, num_aug=0)
+                                                              eval_subsample_size, num_aug=0,
+                                                              start_on_path_copies=start_on_path_copies,
+                                                              near_goal_steps=near_goal_steps,
+                                                              only_start_on_path=only_start_on_path,
+                                                              start_on_path_exact_steps=start_exact_steps)
     
     # Generate test set from remaining pool (skip if eval_ratio=1.0 or no remaining data)
     if remaining_data is not None and len(remaining_data[0]) > 0:
         num_test_groups, num_test, _ = convert_subset("test", source_repo, output_dir, 
                                                        None, num_aug=0,
-                                                       preloaded_data=remaining_data)
+                                                       preloaded_data=remaining_data,
+                                                       start_on_path_copies=start_on_path_copies,
+                                                       near_goal_steps=near_goal_steps,
+                                                       only_start_on_path=only_start_on_path,
+                                                       start_on_path_exact_steps=start_exact_steps)
     else:
         num_test_groups, num_test = 0, 0
         print("✓ Skipping test split (all eval data used for val)")

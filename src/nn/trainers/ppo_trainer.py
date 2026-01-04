@@ -122,7 +122,7 @@ class TRMPPOTrainer(LightningModule):
         if len(obs_list) == 0:
             raise RuntimeError(f"[PPO] No observations after env reset (mazes shape={mazes_np.shape}).")
 
-        self.rollout_buffer.reset()
+        self.rollout_buffer.reset(self.num_envs)
         device = self.device
         episode_buffers: List[List[Dict[str, torch.Tensor]]] = [[] for _ in range(self.num_envs)]
         any_kept = False
@@ -162,6 +162,7 @@ class TRMPPOTrainer(LightningModule):
                 step_counts[idx] += 1
 
                 step_entry = {
+                    "t": t,
                     "obs": obs_t[idx].detach(),
                     "actions": actions[idx].detach(),
                     "rewards": torch.tensor(float(reward), device=device, dtype=torch.float32),
@@ -175,7 +176,8 @@ class TRMPPOTrainer(LightningModule):
                     path_len = info.get("steps", self.rollout_steps)
                     ep_reward = reward_sums[idx]
                     for entry in episode_buffers[idx]:
-                        self.rollout_buffer.add(**entry)
+                        t_entry = entry.pop("t")
+                        self.rollout_buffer.add(t_entry, idx, **entry)
                     any_kept = True
                     self.train_reward_accum.append(ep_reward)
                     self.train_path_accum.append(int(path_len))
@@ -192,14 +194,16 @@ class TRMPPOTrainer(LightningModule):
 
             # Use the freshly computed observations for the next timestep
             obs_list = next_obs_list
+        # Prepare final observations for bootstrapping values (one per env)
+        final_obs_list = []
         for env, base_maze in zip(self.envs, mazes_np):
             if env.done:
-                obs_list.append(env.reset(base_maze))
+                final_obs_list.append(env.reset(base_maze))
             else:
-                obs_list.append(env.grid)
+                final_obs_list.append(env.grid)
 
         # Bootstrap value for final states
-        obs_np = np.stack(obs_list)
+        obs_np = np.stack(final_obs_list)
         obs_t = torch.tensor(obs_np, device=device, dtype=torch.long)
         _, last_values = self.policy_value(obs_t)
         self.last_values = last_values.detach()
@@ -265,6 +269,14 @@ class TRMPPOTrainer(LightningModule):
             return zero, {}
 
         rollouts = self.rollout_buffer.as_batch()
+        # Debug shapes (commented out; enable for debugging rollout/GAE shapes)
+        # print(
+        #     "[PPO] rollouts shapes:",
+        #     {k: tuple(v.shape) for k, v in rollouts.items()},
+        #     "last_values:",
+        #     None if self.last_values is None else tuple(self.last_values.shape),
+        # )
+
         advantages, returns = compute_gae(
             rewards=rollouts["rewards"],
             values=rollouts["values"],

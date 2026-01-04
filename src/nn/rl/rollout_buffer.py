@@ -15,20 +15,28 @@ class RolloutBuffer:
         self.capacity = capacity
         self.storage: Dict[str, torch.Tensor] = {}
         self.ptr = 0
+        self.num_envs: int | None = None
 
-    def reset(self) -> None:
+    def reset(self, num_envs: int | None = None) -> None:
         self.storage = {}
         self.ptr = 0
+        if num_envs is not None:
+            self.num_envs = num_envs
 
-    def add(self, **kwargs) -> None:
+    def add(self, t: int, env_idx: int, **kwargs) -> None:
+        """
+        Store transition at time t for environment env_idx.
+        Expects reset(num_envs) to have been called so we know num_envs.
+        """
+        if self.num_envs is None:
+            raise RuntimeError("Call reset(num_envs=...) before adding to RolloutBuffer.")
         if not self.storage:
             for k, v in kwargs.items():
-                shape = (self.capacity,) + tuple(v.shape)  # keep env + feature dims
+                shape = (self.capacity, self.num_envs) + tuple(v.shape)
                 self.storage[k] = torch.zeros(shape, dtype=v.dtype, device=v.device)
-        idx = self.ptr
         for k, v in kwargs.items():
-            self.storage[k][idx] = v
-        self.ptr += 1
+            self.storage[k][t, env_idx] = v
+        self.ptr = max(self.ptr, t + 1)
 
     def __len__(self) -> int:
         return self.ptr

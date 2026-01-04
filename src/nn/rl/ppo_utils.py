@@ -17,13 +17,28 @@ def compute_gae(
     """
     Generalized Advantage Estimation.
 
-    rewards, values, dones: shape [T, N]
-    last_values: shape [N] (bootstrap value for final state)
+    rewards, values, dones: shape [T, N] (or [T] for single-env)
+    last_values: shape [N] or scalar (bootstrap value for final state)
     """
+    # Ensure rewards/values/dones are at least 2D [T, N]
+    if rewards.ndim == 1:
+        rewards = rewards.unsqueeze(1)
+    if values.ndim == 1:
+        values = values.unsqueeze(1)
+    if dones.ndim == 1:
+        dones = dones.unsqueeze(1)
+
+    # Normalize last_values to shape [N]
+    if last_values.ndim == 0:
+        last_values = last_values.expand(values.shape[1])
+    elif last_values.ndim > 1:
+        last_values = last_values.view(-1)
+
+    values_ext = torch.cat([values, last_values.unsqueeze(0)], dim=0)
+
     T = rewards.shape[0]
     advantages = torch.zeros_like(rewards)
-    last_adv = torch.zeros_like(last_values)
-    values_ext = torch.cat([values, last_values.unsqueeze(0)], dim=0)
+    last_adv = torch.zeros_like(values_ext[0])
 
     for t in reversed(range(T)):
         mask = 1.0 - dones[t].float()
