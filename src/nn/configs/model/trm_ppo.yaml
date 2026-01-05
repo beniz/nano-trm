@@ -36,14 +36,18 @@ backbone:
   seq_len: 0
 
 policy_head:
-  _target_: torch.nn.Linear
+  _target_: src.nn.modules.mlp_head.MLPHead
   in_features: ${model_tuning.hidden_size}
+  hidden_features: ${model_tuning.hidden_size}
   out_features: 4  # 4-way actions
+  activation: "relu"
 
 value_head:
-  _target_: torch.nn.Linear
+  _target_: src.nn.modules.mlp_head.MLPHead
   in_features: ${model_tuning.hidden_size}
+  hidden_features: ${model_tuning.hidden_size}
   out_features: 1
+  activation: "relu"
 
 rollout_buffer:
   _target_: src.nn.rl.rollout_buffer.RolloutBuffer

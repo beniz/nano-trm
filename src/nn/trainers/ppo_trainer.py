@@ -77,6 +77,7 @@ class TRMPPOTrainer(LightningModule):
         self.test_reward_accum: List[float] = []
         self.test_path_accum: List[int] = []
         self._ppo_epoch_counter: int = 0  # track PPO epochs for logging cadence
+        self._ppo_cycle_counter: int = 0  # increments once per rollout+update cycle
         self.eval_config: Optional[Dict[str, Any]] = None  # set externally for periodic eval
 
     def policy_value(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -99,6 +100,8 @@ class TRMPPOTrainer(LightningModule):
             obs = env.reset(maze)
             if obs is None:
                 raise RuntimeError(f"_ensure_envs: env.reset returned None for index {idx}")
+            # Debug reset info
+            print(f"[PPO] Reset env={idx} start={env.agent_pos} goal={env.goal_pos} grid_shape={maze.shape}")
             obs_list.append(obs)
         return obs_list
 
@@ -116,6 +119,7 @@ class TRMPPOTrainer(LightningModule):
             # Flattened sequences -> reshape to grids
             grid_size = int(mazes_np.shape[1] ** 0.5)
             mazes_np = mazes_np.reshape(mazes_np.shape[0], grid_size, grid_size)
+        print(f"[PPO] collect_rollouts batch shape={mazes_np.shape}")
         self.num_envs = mazes_np.shape[0]
         if self.num_envs == 0:
             raise RuntimeError("collect_rollouts received zero mazes in batch.")
@@ -150,15 +154,9 @@ class TRMPPOTrainer(LightningModule):
 
             actions_np = actions.detach().cpu().numpy()
             next_obs_list = []
-            rewards: List[float] = []
-            dones: List[bool] = []
 
             for idx, (env, act) in enumerate(zip(self.envs, actions_np)):
                 next_obs, reward, done, info = env.step(int(act))
-                next_obs_list.append(next_obs)
-                rewards.append(reward)
-                dones.append(done)
-
                 reward_sums[idx] += float(reward)
                 step_counts[idx] += 1
 
@@ -174,24 +172,35 @@ class TRMPPOTrainer(LightningModule):
                 episode_buffers[idx].append(step_entry)
 
                 if done and info.get("reached_goal", False):
-                    path_len = info.get("steps", self.rollout_steps)
+                    # Use env step counter as path length to avoid undercounting
+                    path_len = env.t
                     ep_reward = reward_sums[idx]
                     for entry in episode_buffers[idx]:
                         t_entry = entry.pop("t")
                         self.rollout_buffer.add(t_entry, idx, **entry)
                     any_kept = True
+                    print(f"[PPO] rollout env={idx} done=True reached_goal=True path_len={path_len} reward={ep_reward:.4f}")
                     self.train_reward_accum.append(ep_reward)
                     self.train_path_accum.append(int(path_len))
                     episode_buffers[idx] = []
                     reward_sums[idx] = 0.0
                     step_counts[idx] = 0
                 elif done:
-                    # Episode ended without goal: keep stats but do not add to buffer
-                    self.train_reward_accum.append(reward_sums[idx])
-                    self.train_path_accum.append(step_counts[idx])
+                    # Episode ended without goal: ignore for stats and buffer
+                    print(
+                        f"[PPO] rollout env={idx} done=True reached_goal=False "
+                        f"path_len={env.t} reward={reward_sums[idx]:.4f} max_steps={env.max_steps}"
+                    )
                     episode_buffers[idx] = []
                     reward_sums[idx] = 0.0
                     step_counts[idx] = 0
+
+                # Decide next observation: if done, reset to base maze; otherwise keep next_obs
+                if done:
+                    reset_obs = env.reset(mazes_np[idx])
+                    next_obs_list.append(reset_obs)
+                else:
+                    next_obs_list.append(next_obs)
 
             # Use the freshly computed observations for the next timestep
             obs_list = next_obs_list
@@ -209,25 +218,22 @@ class TRMPPOTrainer(LightningModule):
         _, last_values = self.policy_value(obs_t)
         self.last_values = last_values.detach()
 
-        # Include truncated episodes (not finished within rollout) in stats
-        for r_sum, steps in zip(reward_sums, step_counts):
-            if steps > 0:
-                self.train_reward_accum.append(r_sum)
-                self.train_path_accum.append(steps)
+        # Do not include truncated/failed episodes in stats; only successful ones are kept above
 
         # Log rollout-level stats (avg reward/path) after collection
         #print('len train_reward_accum=', len(self.train_reward_accum))
-        if self.train_reward_accum:
+        if any_kept and self.train_reward_accum:
             avg_train_reward = float(np.mean(self.train_reward_accum))
             avg_train_path = float(np.mean(self.train_path_accum))
             self.log("ppo/train_avg_reward", avg_train_reward, on_step=True, on_epoch=False, prog_bar=False)
             self.log("ppo/train_avg_path_len", avg_train_path, on_step=True, on_epoch=False, prog_bar=False)
-            self.train_reward_accum.clear()
-            self.train_path_accum.clear()
-        if not any_kept:
+        else:
             # No successful episodes; clear buffer to avoid KeyErrors downstream
             print("[PPO] No goal-reaching rollouts collected this cycle.")
             self.rollout_buffer.reset()
+        # Clear accumulators regardless
+        self.train_reward_accum.clear()
+        self.train_path_accum.clear()
 
     def _eval_envs(self, mazes_np: np.ndarray) -> Tuple[float, float]:
         """Greedy eval (argmax policy) on provided mazes. Returns avg_reward, avg_path_len."""
@@ -314,6 +320,7 @@ class TRMPPOTrainer(LightningModule):
             total_mb = len(mb_iter)
             accum_steps = max(1, int(self.optimizer_cfg.get("grad_accum_steps", 1)))
             opt.zero_grad()
+            accum_count = 0  # count how many minibatches have been accumulated in current step
 
             for i, mb in enumerate(mb_iter, 1):
                 logits, values = self.policy_value(mb["obs"])
@@ -331,12 +338,18 @@ class TRMPPOTrainer(LightningModule):
                     value_coef=self.value_coef,
                 )
 
-                loss = loss / accum_steps
+                # Scale by effective accumulation count (handles last partial group)
+                effective_accum = accum_steps
+                if accum_count + 1 < accum_steps and i == total_mb:
+                    effective_accum = accum_count + 1
+                loss = loss / effective_accum
                 self.manual_backward(loss)
+                accum_count += 1
 
-                if i % accum_steps == 0 or i == total_mb:
+                if accum_count == accum_steps or i == total_mb:
                     opt.step()
                     opt.zero_grad()
+                    accum_count = 0
 
                 stats = {k: float(v) for k, v in loss_terms.items()}
                 # print(
@@ -366,11 +379,11 @@ class TRMPPOTrainer(LightningModule):
 
         # Run PPO updates
         loss, stats = self.ppo_update()
+        self._ppo_cycle_counter += 1
 
-        # Log PPO metrics every full PPO cycle
-        if self._ppo_epoch_counter % self.ppo_epochs == 0:
-            for name, value in stats.items():
-                self.log(f"ppo/{name}", value, on_step=True, on_epoch=False, prog_bar=(name == "policy_loss"))
+        # Log PPO metrics once per rollout+update cycle
+        for name, value in stats.items():
+            self.log(f"ppo/{name}", value, on_step=True, on_epoch=False, prog_bar=(name == "policy_loss"))
 
         # Optional test eval (if batch supplies test_maze)
         if isinstance(batch, dict) and batch.get("test_maze") is not None:
@@ -383,7 +396,7 @@ class TRMPPOTrainer(LightningModule):
         eval_cfg = getattr(self, "eval_config", None)
         if eval_cfg and self.trainer:
             interval = max(1, int(eval_cfg.get("interval", 1)))
-            if self._ppo_epoch_counter % interval == 0:
+            if self._ppo_cycle_counter % interval == 0:
                 eval_mazes = eval_cfg.get("mazes")
                 if eval_mazes is not None:
                     avg_eval_reward, avg_eval_path = self._eval_envs(eval_mazes)
